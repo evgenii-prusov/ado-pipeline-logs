@@ -1,6 +1,7 @@
 ---
 name: ado-pipeline-logs
-description: Fetch and analyze Azure DevOps pipeline logs. Use when the user pastes an ADO pipeline URL, asks to "check the build", "get pipeline logs", "debug pipeline failure", "analyze build", "ADO build failed", mentions a build ID, or asks about Azure DevOps pipeline results.
+description: Fetch and analyze Azure DevOps pipeline logs. Use when the user pastes an ADO pipeline URL, asks to "check the build", "get pipeline logs", "debug pipeline failure", "analyze build", "ADO build failed", or mentions a build ID.
+argument-hint: "[build-url or --org ORG --project PROJ --build-id ID]"
 ---
 
 # ADO Pipeline Logs
@@ -14,12 +15,17 @@ For simple checks like "is the build green?" or "what failed?", use `az rest` co
 For deeper debugging (multi-stage failures, root cause analysis, large pipelines), run:
 
 ```bash
-python3 ~/.claude/skills/ado-pipeline-logs/scripts/ado_pipeline_logs.py --url "<ADO_BUILD_URL>"
+python3 "${CLAUDE_SKILL_DIR}/scripts/ado_pipeline_logs.py" --url "<ADO_BUILD_URL>"
 ```
 
 Or with explicit args:
 ```bash
-python3 ~/.claude/skills/ado-pipeline-logs/scripts/ado_pipeline_logs.py --org dsg-dp --project DataMesh --build-id <ID>
+python3 "${CLAUDE_SKILL_DIR}/scripts/ado_pipeline_logs.py" --org dsg-dp --project DataMesh --build-id <ID>
+```
+
+If invoked directly as `/ado-pipeline-logs <url>`, pass arguments through:
+```bash
+python3 "${CLAUDE_SKILL_DIR}/scripts/ado_pipeline_logs.py" --url "$ARGUMENTS"
 ```
 
 The script returns structured JSON with the full stage/job/task hierarchy and log content.
