@@ -1,0 +1,99 @@
+# ADO Pipeline Log Fetching
+
+## Authentication
+
+Use `az rest` with the Azure DevOps well-known app ID as `--resource`:
+
+```bash
+az rest --resource 499b84ac-1321-427f-aa17-267ca6975798 --url "<ADO_API_URL>"
+```
+
+This acquires an AAD token scoped to Azure DevOps and injects it as a Bearer header automatically. No Python, no PAT, no manual token handling needed.
+
+## Project Reference
+
+| Field | Value |
+|-------|-------|
+| Organization | `dsg-dp` |
+| Project name | `DataMesh` |
+| Project GUID | `35a24d0c-d1d0-4a22-9aae-27e2e53daa50` |
+| API base | `https://dev.azure.com/dsg-dp/DataMesh` |
+| API version | `7.0` |
+| IaC pipeline | `cd-IaC` (definition ID `2090`) |
+
+## Workflow: Fetch Pipeline Logs
+
+### Step 1: List recent builds
+
+```bash
+az rest --resource 499b84ac-1321-427f-aa17-267ca6975798 \
+  --url "https://dev.azure.com/dsg-dp/DataMesh/_apis/build/builds?\$top=5&api-version=7.0"
+```
+
+Filter by pipeline definition:
+```bash
+az rest --resource 499b84ac-1321-427f-aa17-267ca6975798 \
+  --url "https://dev.azure.com/dsg-dp/DataMesh/_apis/build/builds?definitions=2090&\$top=5&api-version=7.0"
+```
+
+### Step 2: Get timeline (find failed tasks and their log IDs)
+
+```bash
+az rest --resource 499b84ac-1321-427f-aa17-267ca6975798 \
+  --url "https://dev.azure.com/dsg-dp/DataMesh/_apis/build/builds/{buildId}/timeline?api-version=7.0"
+```
+
+Parse the timeline to find tasks:
+```bash
+az rest --resource 499b84ac-1321-427f-aa17-267ca6975798 \
+  --url "https://dev.azure.com/dsg-dp/DataMesh/_apis/build/builds/{buildId}/timeline?api-version=7.0" \
+  2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for r in data.get('records', []):
+    if r.get('type') == 'Task' and r.get('log'):
+        print(f\"{r['name']:40s} | result: {r.get('result','?'):20s} | log: {r['log']['id']}\")
+"
+```
+
+Key fields in timeline records:
+- `type`: "Stage", "Phase", "Job", "Task" -- filter to `Task` for step-level info
+- `result`: "succeeded", "succeededWithIssues", "failed", "canceled", "skipped"
+- `log.id`: the log ID needed for Step 3
+- `issues[]`: inline error/warning messages (quick triage without fetching full log)
+- `parentId`: build Stage->Job->Task hierarchy
+- `order`: sort order within each level
+
+### Step 3: Fetch log content
+
+```bash
+az rest --resource 499b84ac-1321-427f-aa17-267ca6975798 \
+  --url "https://dev.azure.com/dsg-dp/DataMesh/_apis/build/builds/{buildId}/logs/{logId}?api-version=7.0" \
+  2>/dev/null
+```
+
+The log endpoint returns **plain text**, not JSON. Redirect stderr to suppress the harmless `WARNING: Not a json response` message from `az rest`.
+
+## Caveats
+
+- **`$top` escaping**: Use `\$top` in bash to prevent shell variable expansion
+- **Plain-text logs**: The log content endpoint returns plain text. `az rest` prints a WARNING to stderr -- this is expected, not an error. Use `2>/dev/null` to suppress it.
+- **Token expiry**: `az` tokens last ~1 hour. If you get a 401, run `az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798` to refresh, then retry.
+- **Do NOT use**: `az pipelines runs log` or `az pipelines runs download-logs` -- these subcommands don't exist
+- **Do NOT use**: `az rest --resource "https://dev.azure.com"` -- the URL form fails (AADSTS500011). Always use the app ID: `499b84ac-1321-427f-aa17-267ca6975798`
+
+## Common Error Patterns in cd-IaC Logs
+
+| Error | Meaning | Fix |
+|-------|---------|-----|
+| `User "X" does not exist or not authorized` | User email in YAML doesn't match any Snowflake user | Remove user from YAML or fix email |
+| `Role cannot be dropped because one or more PIPEs are executing` | A Snowflake object is owned by the role being dropped | Transfer ownership: `GRANT OWNERSHIP ON ... TO ROLE SYSADMIN REVOKE CURRENT GRANTS` |
+| `Final check` fails with unprocessed files | Usually caused by empty YAML keys (e.g. `bi-developers:` with null value) | Remove the empty key from the YAML file |
+
+## For Structured Analysis
+
+For complex multi-stage failures or large pipelines, use the skill script:
+```bash
+python3 ~/.claude/skills/ado-pipeline-logs/scripts/ado_pipeline_logs.py --url "https://dev.azure.com/dsg-dp/DataMesh/_build/results?buildId={buildId}"
+```
+This builds the full stage/job/task hierarchy, fetches all logs, truncates large outputs, and returns structured JSON.
