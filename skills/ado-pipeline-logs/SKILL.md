@@ -37,34 +37,19 @@ The script returns structured JSON with the full stage/job/task hierarchy and lo
 ## How to analyze the output
 
 1. Check `summary.failed_task_names` for a quick overview
-2. Check `summary.succeeded_tasks_with_errors` — **this is critical**. Some pipelines use a
-   "collect errors, fail at the end" pattern where the failed task only says "X files not
-   processed" but the actual stack trace is in a preceding succeeded task's log. If the
-   failed task log contains no diagnostics, the root cause is here.
-3. Look at tasks with `"result": "failed"` and read their `log` and `issues[]`
-4. If the failed task log is empty or generic, read the `error_snippet` on the succeeded
-   tasks listed in `summary.succeeded_tasks_with_errors`
-
-### Known pattern: error buried in a succeeded task
-
-Symptom: failed task log only says something like "The following files have not been
-processed due to errors: [list]" with no stack trace.
-
-Action: look at `summary.succeeded_tasks_with_errors` — the actual exception (e.g.
-`TypeError`, `ProgrammingError`) will be in the `error_snippet` of a task like
-"Dry run on non-execution mode" that ran earlier and swallowed its errors.
+2. Look at tasks with `"result": "failed"` and read their `log` and `issues[]`
+3. If the failed task log is empty or generic, check `summary.succeeded_tasks_with_errors` —
+   some pipelines log errors in tasks that still report success, so the root cause may be
+   in a succeeded task's `error_snippet` rather than the failed task itself
 
 ## Flags
 
 - Default: fetches all task logs; succeeded tasks are compressed to last 30 lines + error snippets
-- `--failed-only`: only fetches logs for failed tasks — fastest mode, but **will miss** errors
-  logged in succeeded tasks (use only when you know the pattern is not "collect errors, fail at end")
+- `--failed-only`: only fetches logs for failed tasks — fastest mode, but will miss errors
+  logged in succeeded tasks
 
 ## Presenting findings
 
 - Lead with the root cause and evidence from the log text
 - Quote specific error lines from the logs
-- If the error matches a known pattern (see CLAUDE.md error table), include the fix
-- For Snowflake deployment errors, check if the user/role exists and suggest YAML or ownership changes
-- If root cause came from a succeeded task, call this out explicitly: "The failed task contains
-  no diagnostics — the actual error was found in [task name] which reported success"
+- If root cause came from a succeeded task, call this out explicitly
