@@ -25,6 +25,29 @@ ADO_RESOURCE_ID = "499b84ac-1321-427f-aa17-267ca6975798"
 MAX_LOG_LINES = 5000
 HEAD_LINES = 200
 TAIL_LINES = 500
+SUCCEEDED_TAIL_LINES = 30   # Lines kept from the end of succeeded task logs
+ERROR_CONTEXT_LINES = 5     # Lines of context around each error marker
+
+# Patterns that indicate an error buried in a succeeded task's log.
+# All matched case-insensitively.
+ERROR_MARKERS = [
+    "##[error]",
+    "traceback (most recent call last)",
+    "typeerror:",
+    "valueerror:",
+    "keyerror:",
+    "attributeerror:",
+    "importerror:",
+    "nameerror:",
+    "runtimeerror:",
+    "syntaxerror:",
+    "exception:",
+    "sqlcompilationerror",
+    "programmingerror",
+    "has not been processed due to errors",
+    "failed:",
+    "error:",
+]
 
 
 def get_token():
@@ -107,6 +130,48 @@ def truncate_log(log_text):
     return "\n".join(head + [f"\n[... {truncated} lines truncated ...]\n"] + tail)
 
 
+def extract_error_snippet(log_text):
+    """Scan a log for error markers and return context lines around each match.
+
+    Returns (snippet_str, has_errors). snippet_str is empty when has_errors is False.
+    """
+    if not isinstance(log_text, str):
+        return "", False
+    lines = log_text.splitlines()
+    hit_indices = set()
+    for i, line in enumerate(lines):
+        line_lower = line.lower()
+        if any(marker in line_lower for marker in ERROR_MARKERS):
+            for j in range(max(0, i - ERROR_CONTEXT_LINES),
+                           min(len(lines), i + ERROR_CONTEXT_LINES + 1)):
+                hit_indices.add(j)
+    if not hit_indices:
+        return "", False
+    result = []
+    prev = None
+    for idx in sorted(hit_indices):
+        if prev is not None and idx > prev + 1:
+            result.append("[...]")
+        result.append(lines[idx])
+        prev = idx
+    return "\n".join(result), True
+
+
+def process_succeeded_log(log_text):
+    """Compress a succeeded task's log.
+
+    Returns a dict with:
+      - "tail":    last SUCCEEDED_TAIL_LINES lines (always present)
+      - "error_snippet": error-marker lines with context, or None
+    """
+    if not isinstance(log_text, str):
+        return {"tail": None, "error_snippet": None}
+    lines = log_text.splitlines()
+    tail = "\n".join(lines[-SUCCEEDED_TAIL_LINES:])
+    snippet, has_errors = extract_error_snippet(log_text)
+    return {"tail": tail, "error_snippet": snippet if has_errors else None}
+
+
 def _make_task(task_rec):
     return {
         "name": task_rec.get("name"),
@@ -117,19 +182,9 @@ def _make_task(task_rec):
         "warning_count": task_rec.get("warningCount", 0),
         "issues": task_rec.get("issues", []),
         "log_id": (task_rec.get("log") or {}).get("id"),
-        "log": None  # filled later
+        "log": None,           # full log for failed tasks
+        "error_snippet": None, # error lines found in a succeeded task
     }
-
-
-def _collect_tasks(children, parent_id):
-    """Recursively collect Task records under a parent (handles Phase->Job->Task)."""
-    tasks = []
-    for child in children.get(parent_id, []):
-        if child.get("type") == "Task":
-            tasks.append(_make_task(child))
-        elif child.get("type") in ("Job", "Phase"):
-            tasks.extend(_collect_tasks(children, child["id"]))
-    return tasks
 
 
 def build_hierarchy(records):
@@ -156,7 +211,6 @@ def build_hierarchy(records):
                 "state": r.get("state"),
                 "jobs": []
             }
-            # Collect Phase children of Stage, then Job children of Phase
             for phase_rec in children.get(r["id"], []):
                 if phase_rec.get("type") != "Phase":
                     continue
@@ -185,7 +239,8 @@ def main():
     parser.add_argument("--project", help="ADO project name")
     parser.add_argument("--build-id", help="Build ID")
     parser.add_argument("--failed-only", action="store_true",
-                        help="Only fetch logs for failed tasks")
+                        help="Only fetch logs for failed tasks (fastest, but misses errors "
+                             "logged in succeeded tasks)")
     args = parser.parse_args()
 
     if args.url:
@@ -216,35 +271,55 @@ def main():
     records = timeline.get("records", [])
     stages = build_hierarchy(records)
 
-    tasks_to_fetch = []
+    # Fetch logs
     for stage in stages:
         for job in stage["jobs"]:
             for task in job["tasks"]:
-                if task["log_id"] is not None:
-                    if args.failed_only and task["result"] != "failed":
-                        continue
-                    tasks_to_fetch.append(task)
+                if task["log_id"] is None:
+                    continue
+                if args.failed_only and task["result"] != "failed":
+                    continue
 
-    for task in tasks_to_fetch:
-        log_data = fetch(
-            f"{api_base}/build/builds/{build_id}/logs/{task['log_id']}?api-version=7.0",
-            auth
-        )
-        if isinstance(log_data, str):
-            task["log"] = truncate_log(log_data)
-        elif isinstance(log_data, dict) and "error" in log_data:
-            task["log"] = f"[Error fetching log: {log_data['error']}]"
-        else:
-            task["log"] = None
+                log_data = fetch(
+                    f"{api_base}/build/builds/{build_id}/logs/{task['log_id']}?api-version=7.0",
+                    auth
+                )
+                if isinstance(log_data, dict) and "error" in log_data:
+                    task["log"] = f"[Error fetching log: {log_data['error']}]"
+                    continue
 
+                if task["result"] == "failed":
+                    task["log"] = truncate_log(log_data)
+                else:
+                    processed = process_succeeded_log(log_data)
+                    task["log"] = processed["tail"]
+                    task["error_snippet"] = processed["error_snippet"]
+
+    # Build summary
     all_tasks = [t for s in stages for j in s["jobs"] for t in j["tasks"]]
+
+    succeeded_with_errors = []
+    for stage in stages:
+        for job in stage["jobs"]:
+            for task in job["tasks"]:
+                if task["result"] != "failed" and task.get("error_snippet"):
+                    succeeded_with_errors.append({
+                        "stage": stage["name"],
+                        "job": job["name"],
+                        "task": task["name"],
+                        "error_snippet": task["error_snippet"],
+                    })
+
     summary = {
         "total_tasks": len(all_tasks),
         "succeeded": sum(1 for t in all_tasks if t["result"] == "succeeded"),
         "failed": sum(1 for t in all_tasks if t["result"] == "failed"),
         "skipped": sum(1 for t in all_tasks if t["result"] == "skipped"),
         "other": sum(1 for t in all_tasks if t["result"] not in ("succeeded", "failed", "skipped")),
-        "failed_task_names": [t["name"] for t in all_tasks if t["result"] == "failed"]
+        "failed_task_names": [t["name"] for t in all_tasks if t["result"] == "failed"],
+        # Errors found in tasks that reported success — check these when the failed
+        # task log contains no useful diagnostics.
+        "succeeded_tasks_with_errors": succeeded_with_errors,
     }
 
     output = {
@@ -257,7 +332,7 @@ def main():
         "start_time": build.get("startTime"),
         "finish_time": build.get("finishTime"),
         "stages": stages,
-        "summary": summary
+        "summary": summary,
     }
 
     print(json.dumps(output, indent=2))
